@@ -63,9 +63,11 @@ class Database:
                         created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                         seen BOOLEAN DEFAULT FALSE,
                         metadata JSON NULL,
+                        size_bytes INT NULL,
                         INDEX idx_link_token (link_token),
                         INDEX idx_created_at (created_at),
-                        INDEX idx_seen (seen)
+                        INDEX idx_seen (seen),
+                        INDEX idx_messages_unseen (link_token, seen, created_at)
                     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
                 """)
                 
@@ -169,23 +171,51 @@ class Database:
         try:
             with self.connection.cursor() as cursor:
                 import json
+                import base64
+                
                 metadata_json = json.dumps(metadata) if metadata else None
                 
-                sql = """
-                    INSERT INTO messages (link_token, encrypted_message, metadata)
-                    VALUES (%s, %s, %s)
-                """
-                cursor.execute(sql, (link_token, encrypted_message, metadata_json))
+                # Calculate size_bytes (decoded message size)
+                try:
+                    size_bytes = len(base64.b64decode(encrypted_message))
+                except Exception:
+                    size_bytes = None
+                
+                # Check if size_bytes column exists
+                has_size_column = False
+                try:
+                    cursor.execute("SHOW COLUMNS FROM messages LIKE 'size_bytes'")
+                    col = cursor.fetchone()
+                    if col:
+                        has_size_column = True
+                except Exception:
+                    has_size_column = False
+                
+                if has_size_column and size_bytes is not None:
+                    sql = """
+                        INSERT INTO messages (link_token, encrypted_message, metadata, size_bytes)
+                        VALUES (%s, %s, %s, %s)
+                    """
+                    cursor.execute(sql, (link_token, encrypted_message, metadata_json, size_bytes))
+                else:
+                    sql = """
+                        INSERT INTO messages (link_token, encrypted_message, metadata)
+                        VALUES (%s, %s, %s)
+                    """
+                    cursor.execute(sql, (link_token, encrypted_message, metadata_json))
+                
                 return cursor.lastrowid
                 
         except Exception as e:
             print(f"Error storing message: {e}")
             raise e
     
-    def get_messages(self, link_token, include_seen=False, limit=50, before_id=None):
+    def get_messages(self, link_token, include_seen=False, limit=50, before_id=None, since_id=None, order='DESC'):
         """Get messages for a client with pagination.
         limit: number of messages to return (capped at 200)
-        before_id: return messages with id < before_id (cursor pagination)
+        before_id: return messages with id < before_id (cursor pagination for DESC order)
+        since_id: return messages with id > since_id (cursor pagination for ASC order / polling)
+        order: 'ASC' for chronological (older->newer), 'DESC' for reverse chronological (newer->older)
         """
         if not self.connected:
             return []
@@ -196,18 +226,31 @@ class Database:
                 if limit is None or not isinstance(limit, int):
                     limit = 50
                 limit = max(1, min(limit, 200))
+                
+                # Validate order
+                if order not in ['ASC', 'DESC']:
+                    order = 'DESC'
+                
                 base_condition = "link_token = %s"
                 seen_condition = "" if include_seen else "AND seen = FALSE"
                 cursor_condition = ""
                 params = [link_token]
-                if before_id is not None:
+                
+                # Handle cursor pagination
+                if since_id is not None:
+                    # For polling (ASC order typically)
+                    cursor_condition = "AND id > %s"
+                    params.append(since_id)
+                elif before_id is not None:
+                    # For infinite scroll (DESC order typically)
                     cursor_condition = "AND id < %s"
                     params.append(before_id)
+                
                 sql = f"""
                     SELECT id, encrypted_message, created_at, seen, metadata
                     FROM messages
                     WHERE {base_condition} {seen_condition} {cursor_condition}
-                    ORDER BY id DESC
+                    ORDER BY id {order}
                     LIMIT %s
                 """
                 params.append(limit)
