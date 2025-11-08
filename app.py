@@ -17,7 +17,9 @@ from utils import (
     hash_token,
     generate_challenge_nonce,
     validate_public_key,
-    verify_signature
+    verify_signature,
+    sanitize_input,
+    create_response
 )
 
 def run_migrations():
@@ -99,7 +101,12 @@ def register():
             return jsonify({'error': 'Public key is required'}), 400
             
         public_key = data['public_key']
-        display_name = data.get('display_name')
+        display_name = sanitize_input(data.get('display_name'))
+        key_type = data.get('key_type', 'ed25519')
+        
+        # Validate key_type (only Ed25519 supported)
+        if key_type not in ['ed25519']:
+            return jsonify({'error': 'Unsupported key_type. Only ed25519 is supported.'}), 400
         
         # Validate the public key format
         if not validate_public_key(public_key):
@@ -116,7 +123,7 @@ def register():
             link_token=link_token,
             fetch_token_hash=fetch_token_hash,
             display_name=display_name,
-            key_type='ed25519'
+            key_type=key_type
         )
         
         # Construct shareable link
@@ -128,7 +135,8 @@ def register():
             'client_id': client_id,
             'link': shareable_link,
             'link_token': link_token,
-            'fetch_token': fetch_token  # Client must store this securely!
+            'fetch_token': fetch_token,  # Client must store this securely!
+            'key_type': key_type
         }), 201
         
     except Exception as e:
@@ -259,6 +267,12 @@ def fetch_messages():
     Requires either:
     - challenge_signature (proving ownership of private key), OR
     - fetch_token in Authorization header
+    
+    Pagination parameters:
+    - limit: number of messages to return (default 50, max 200)
+    - before_id: for infinite scroll (DESC order)
+    - since_id: for polling new messages (ASC order)
+    - order: 'ASC' or 'DESC' (default 'DESC')
     """
     try:
         data = request.get_json()
@@ -313,11 +327,22 @@ def fetch_messages():
         include_seen = data.get('include_seen', False)
         limit = data.get('limit', 50)
         before_id = data.get('before_id')
+        since_id = data.get('since_id')
+        order = data.get('order', 'DESC')
+        
         try:
             limit = int(limit)
         except Exception:
             limit = 50
-        messages = db.get_messages(link_token, include_seen=include_seen, limit=limit, before_id=before_id)
+            
+        messages = db.get_messages(
+            link_token, 
+            include_seen=include_seen, 
+            limit=limit, 
+            before_id=before_id,
+            since_id=since_id,
+            order=order
+        )
         
         # Format response
         message_list = []
@@ -330,10 +355,22 @@ def fetch_messages():
                 'metadata': json.loads(msg['metadata']) if msg['metadata'] else None
             })
         
-        return jsonify({
+        # Add pagination metadata
+        response_data = {
             'message': 'Messages retrieved successfully',
-            'data': message_list
-        }), 200
+            'data': message_list,
+            'count': len(message_list),
+            'has_more': len(message_list) == limit
+        }
+        
+        # Add next_cursor for pagination
+        if message_list:
+            if order == 'ASC':
+                response_data['next_cursor'] = message_list[-1]['id']
+            else:
+                response_data['next_cursor'] = message_list[-1]['id']
+        
+        return jsonify(response_data), 200
         
     except Exception as e:
         return jsonify({'error': str(e)}), 500
@@ -438,7 +475,7 @@ def request_message_permission():
             
         from_link_token = data['from_link_token']
         to_link_token = data['to_link_token']
-        from_nickname = data.get('from_nickname', 'Anonymous')
+        from_nickname = sanitize_input(data.get('from_nickname', 'Anonymous'))
         
         # Verify both clients exist
         from_client = db.get_client_by_link_token(from_link_token)
